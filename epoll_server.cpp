@@ -11,7 +11,16 @@
 #include <algorithm>
 #include <sys/epoll.h>
 #include <fcntl.h>
-#include "server.h"
+#include <unordered_map>
+#include <shared_mutex>
+#define PORT 8080
+#define MAX_EVENTS 1024
+
+std::unordered_map<int, std::string> fd_to_name; // user list
+std::shared_mutex client_info_mutex;
+
+void handle_client_event(int);
+void epoll_event_loop(int, int);
 
 int main(){
     // 1. Create socket

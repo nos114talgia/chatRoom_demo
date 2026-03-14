@@ -33,7 +33,7 @@ int main(){
     std::string username;
     std::cout << "Enter username: ";
     std::getline(std::cin, username);
-
+    username += "\n";
     send(client_socket, username.c_str(), username.length(), 0);
 
     std::thread receive_msg(receive_message, client_socket);
@@ -51,6 +51,7 @@ void send_message(int client_socket){
     while(true){
         std::string message;
         getline(std::cin, message);
+        message += "\n";
         if(send(client_socket, message.c_str(), message.length(), 0) < 0){
             std::cout << "Error sending message" << std::endl;
             break;

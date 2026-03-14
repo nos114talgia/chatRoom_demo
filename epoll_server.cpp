@@ -11,12 +11,13 @@
 #include <algorithm>
 #include <sys/epoll.h>
 #include <fcntl.h>
-#include <unordered_map>
 #include <shared_mutex>
+#include <unordered_map>
 #define PORT 8080
 #define MAX_EVENTS 1024
 
-std::unordered_map<int, std::string> fd_to_name; // user list
+std::unordered_map<int, std::string> fd_to_name;     // user list
+std::unordered_map<int, std::string> client_buffer;  // user buffer
 std::shared_mutex client_info_mutex;
 
 void handle_client_event(int);
@@ -71,17 +72,6 @@ int main(){
     }
 
     epoll_event_loop(server_socket, epoll_fd);
-
-
-
-
-
-
-
-
-
-
-
 
     close(server_socket);
     return 0;
@@ -142,41 +132,60 @@ void epoll_event_loop(int server_socket, int epoll_fd){
 void handle_client_event(int client_fd){
     char buffer[1024];
     while(true){
-        int bytes = recv(client_fd, buffer, 1023, 0);
+        ssize_t bytes = recv(client_fd, buffer, 1024, 0);
         if(bytes > 0){
-            buffer[bytes] = '\0';
-            std::string input{buffer};
-            input.erase(input.find_last_not_of(" \n\r\t") + 1);
-            if(input.empty()){
-                continue;
-            }
-            // check if user has already registered
+            std::vector<std::string> complete_lines;
             {
-                std::shared_lock<std::shared_mutex> read_lock(client_info_mutex);
-                auto it = fd_to_name.find(client_fd);
-                if(it == fd_to_name.end()){  // user hasn't registered, then its first message is considered as username
-                    read_lock.unlock();
+                std::unique_lock<std::shared_mutex> lock(client_info_mutex);
+                std::string& buf = client_buffer[client_fd];
+                buf.append(buffer, bytes);
+                ssize_t pos;
+                while((pos = buf.find('\n')) != std::string::npos){
+                    complete_lines.push_back(buf.substr(0, pos));
+                    buf.erase(0, pos + 1);
+                }
+            }
+
+            for(auto& line : complete_lines){
+                if(!line.empty() && line.back() == '\r'){
+                    line.pop_back();
+                }
+                if(line.empty()){
+                    continue;
+                }
+                bool is_registration = false;
+                std::string sender_name;
+                {
                     std::unique_lock<std::shared_mutex> write_lock(client_info_mutex);
-                    fd_to_name[client_fd] = input;
-                    write_lock.unlock();
-                    std::string welcome = "Welcome " + input + "!";
+                    auto it = fd_to_name.find(client_fd);
+                    if(it == fd_to_name.end()){
+                        fd_to_name[client_fd] = line;
+                        sender_name = line;
+                        is_registration = true;
+                    }else{
+                        sender_name = it->second;
+                        is_registration = false;
+                    }
+                }
+                if(is_registration){
+                    std::string welcome = "Welcome " + sender_name + "!\n";
                     send(client_fd, welcome.c_str(), welcome.size(), 0);
-                    std::cout << input << " has joined the chat" << std::endl;
+                    std::cout << "[Log] New User registered: " << sender_name << " (FD: " << client_fd << ")" << std::endl;
                 }else{
-                    std::string sender_name = it->second;
-                    std::string broadcast_msg = "@" + sender_name + ": " + input;
-                    for(const auto& [fd, name] : fd_to_name){
-                        if(fd != client_fd){
-                            send(fd, broadcast_msg.c_str(), broadcast_msg.size(), 0);
+                    std::string broadcast_msg = "@" + sender_name + ": " + line + "\n";
+                    std::shared_lock<std::shared_mutex> read_lock(client_info_mutex);
+                    for (const auto& [target_fd, name] : fd_to_name) {
+                        if (target_fd != client_fd) {
+                            send(target_fd, broadcast_msg.c_str(), broadcast_msg.size(), 0);
                         }
                     }
                 }
             }
-        }
-        else if(bytes == 0){
+        }else if(bytes == 0){
             std::unique_lock<std::shared_mutex> write_lock(client_info_mutex);
-            std::cout << "Client " << fd_to_name[client_fd] << "disconnected" << std::endl;
+            std::cout << "Client " << fd_to_name[client_fd] << " disconnected" << std::endl;
             fd_to_name.erase(client_fd);
+            client_buffer.erase(client_fd);
             write_lock.unlock();
             close(client_fd);
             break;
@@ -189,6 +198,7 @@ void handle_client_event(int client_fd){
                 std::cerr << "Error receiving message from client" << std::endl;
                 std::unique_lock<std::shared_mutex> write_lock(client_info_mutex);
                 fd_to_name.erase(client_fd);
+                client_buffer.erase(client_fd);
                 close(client_fd);
                 break;
             }

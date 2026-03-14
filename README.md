@@ -70,38 +70,32 @@ chatRoom.h
    * One for **receiving messages**
 
 ---
+## How the Optimized Epoll-Server Works
 
-## How Epoll-server Works
+### 1. Non-Blocking Foundation
+The server initializes a TCP socket and immediately sets it to **Non-Blocking** mode using `fcntl`. This is critical for the Edge-Triggered model: it ensures that when the server performs I/O operations (like `accept4` or `recv`), it never hangs, allowing the system to handle thousands of concurrent "silent" connections without wasting CPU cycles.
 
-### 1. Initialization and Non-Blocking Setup
-The server begins by creating a standard TCP socket. To achieve high concurrency, the socket is set to **Non-Blocking** mode using `fcntl`. This prevents the server from hanging on a single `accept` or `recv` call, allowing it to move quickly between different client events.
+### 2. Edge-Triggered (ET) Event Loop
+The server utilizes `epoll` in **Edge-Triggered (ET)** mode (`EPOLLET`). 
+*   **Efficiency:** Unlike Level-Triggered mode, ET only notifies the server when a state change occurs (e.g., new data arrives). 
+*   **The "Drain" Requirement:** Because of ET, the server must fully "drain" the kernel buffers. For new connections, it loops `accept4` until `EAGAIN`. For data, it loops `recv` until no more bytes are available.
 
-### 2. Epoll Instance & Edge-Triggered (ET) Registration
-An `epoll` instance is created via `epoll_create1`. The server socket is added to the interest list with the `EPOLLET` (Edge-Triggered) flag. 
-* **Why ET?** Unlike Level-Triggered mode, ET only notifies the server once when new data arrives. This reduces redundant event notifications and is significantly more efficient for high-load environments.
+### 3. Application-Layer Buffering (Handling TCP Streams)
+TCP is a byte-stream protocol, meaning message boundaries are not guaranteed (data may arrive in fragments or "stick" together). The server solves this using a **Per-Client Buffer**:
+*   **Accumulation:** Raw bytes from `recv` are appended to a `std::string` buffer unique to each File Descriptor (`client_buffer[fd]`).
+*   **Delimiter Parsing:** The server searches for the `\n` delimiter. Only when a complete line is found is the data moved to the processing stage. This ensures that even if a client sends a message in pieces, the server reconstructs it perfectly.
 
-### 3. The Central Event Loop
-The `epoll_event_loop` function runs an infinite loop calling `epoll_wait`. 
-* When `epoll_wait` returns, it provides a list of file descriptors (FDs) that are ready for I/O.
-* **Server FD Ready:** If the activity is on the listening socket, the server enters a loop to `accept4` all pending incoming connections until the queue is empty (indicated by `EAGAIN`).
-* **Client FD Ready:** If activity is on a client socket, the server triggers the data handling logic.
+### 4. Optimized Lock Splitting Strategy
+To maintain high performance under heavy load, the server employs a **Granular Locking** strategy using `std::shared_mutex` and C++17 `inline` variables:
+*   **Phase A (Write Lock):** A short-lived `unique_lock` is used to update the client's private buffer and extract complete lines into a local thread-safe vector.
+*   **Phase B (Write Lock):** If the user is unregistered, a `unique_lock` is used briefly to update the `fd_to_name` map.
+*   **Phase C (Shared Lock):** During broadcasting, the server switches to a `shared_lock` (read lock). This allows multiple threads to read the user map and send messages simultaneously, preventing a slow `send` operation to one client from blocking the registration of another.
 
-### 4. Edge-Triggered Data Processing
-Because the server uses Edge-Triggered mode, the `handle_client_event` function must read **all** available data in a single event trigger. 
-* It uses a `while(true)` loop with `recv` to drain the kernel buffer.
-* If `recv` returns `EAGAIN` or `EWOULDBLOCK`, it means there is no more data to read for now, and the server safely returns to the event loop.
-
-### 5. Thread-Safe User Management
-The server maintains a mapping of file descriptors to usernames (`fd_to_name`). To ensure data consistency:
-* **`std::shared_mutex`**: This allows a "Multiple Readers, Single Writer" approach. 
-* When broadcasting messages, the server acquires a **shared lock** (read lock), allowing multiple threads to broadcast simultaneously.
-* When a user joins or leaves (modifying the map), it acquires a **unique lock** (write lock) to prevent race conditions.
-
-### 6. Chat Protocol Logic
-The server implements a simple state-based logic for every client:
-1. **Registration Phase**: The very first string a client sends is recorded as their username.
-2. **Messaging Phase**: Every subsequent message is prefixed with the sender's name (e.g., `@Alice: Hello!`) and broadcasted to every other active file descriptor found in the map.
-3. **Disconnection**: If `recv` returns 0, the server removes the user from the map and closes the socket, automatically cleaning up resources.
+### 5. Robust Protocol Handling
+The server implements a clean, line-based chat protocol:
+*   **Registration:** The first complete line received (trimmed of `\r\n`) is registered as the client's identity.
+*   **Broadcasting:** Every subsequent line is treated as a chat message. The server prefixes it with the sender's name (e.g., `@Bob: hello`) and iterates through the map to forward it to all other active peers.
+*   **Cleanup:** Upon receiving 0 bytes (graceful close) or a TCP error, the server acquires a write lock to remove the user from the map and the buffer, ensuring no memory leaks or dangling file descriptors.
 
 ---
 
